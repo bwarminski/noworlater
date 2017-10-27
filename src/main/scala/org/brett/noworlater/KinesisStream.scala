@@ -22,7 +22,7 @@ object KinesisStream {
   val initialBatchSize = 3600
   val batchSize: AtomicInteger = new AtomicInteger(initialBatchSize)
   val delta = 10
-  val readRateLimiter = RateLimiter.create(5.0) // Allow 5 req/sec - per kinesis limits
+  val readRateLimiter = RateLimiter.create(2.5) // Allow 5 req/sec - per kinesis limits
 }
 
 case class StreamRecords(behindLatest: Long, nextIterator: Option[String], events: Seq[Messages.Message])
@@ -48,10 +48,10 @@ class KinesisStream(val config: KinesisStreamConfig, kinesis: AmazonKinesis) ext
 
   def nextRecords(iterator: String): StreamRecords = {
     readRateLimiter.acquire()
-    logger.info("Requesting {} records from stream", KinesisStream.batchSize.get())
+    logger.debug("Requesting {} records from stream", KinesisStream.batchSize.get())
     val records = kinesis.getRecords(new GetRecordsRequest().withLimit(KinesisStream.batchSize.get()).withShardIterator(iterator))
     val bytes = records.getRecords.asScala.map((r) => r.getData.remaining().toLong).sum
-    logger.info("Read {} bytes from stream. {} ms behind latest.", bytes.toString, records.getMillisBehindLatest.toString)
+    logger.debug("Read {} bytes from stream. {} ms behind latest.", bytes.toString, records.getMillisBehindLatest.toString)
     if (bytes < KinesisStream.targetBytes) {
       if (records.getMillisBehindLatest > 1000) {
         KinesisStream.batchSize.getAndUpdate((operand: Int) => (operand + KinesisStream.delta).min(10000))
@@ -81,7 +81,7 @@ class KinesisStream(val config: KinesisStreamConfig, kinesis: AmazonKinesis) ext
 
   def add(messages: Seq[DelayedMessage]) = {
     val records = messages.groupBy((m) => {
-      BigInt(MessageDigest.getInstance("MD5").digest(m.id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
+      BigInt(1, MessageDigest.getInstance("MD5").digest(m.id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
     }).flatMap((t) => {
       val (partitionKey, ids) = t
       ids.grouped(config.batchSize).map((group) => {
@@ -96,7 +96,7 @@ class KinesisStream(val config: KinesisStreamConfig, kinesis: AmazonKinesis) ext
 
   def remove(ids: Seq[String]) = {
     val records = ids.groupBy((id) => {
-      BigInt(MessageDigest.getInstance("MD5").digest(id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
+      BigInt(1, MessageDigest.getInstance("MD5").digest(id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
     }).flatMap((t) => {
       val (partitionKey, ids) = t
       ids.grouped(config.batchSize).map((group) => {

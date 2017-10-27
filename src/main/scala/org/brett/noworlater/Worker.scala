@@ -14,7 +14,7 @@ object Worker extends App with StrictLogging {
   logger.info("Starting")
   val kinesisClient = AmazonKinesisClientBuilder.standard().withEndpointConfiguration(new EndpointConfiguration("http://localhost:4567", "us-east-1")).build()
   val shard = "shardId-000000000000"
-  val config = KinesisStreamConfig("test", shard, 128, 300, "1")
+  val config = KinesisStreamConfig("test", shard, 16, 300, "1")
   val kinesis = new KinesisStream(config, kinesisClient)
 
   val redis = new RedisClient("localhost", 6379)
@@ -66,16 +66,16 @@ class Worker(val kinesis: KinesisStream, val redis: RedisClient, val clock: Cloc
             })
           }
           case s: Sync if s.id == syncUUID => {
-            logger.info("Reached sync, dumping records")
+
             for (
               partitions <- redis.smembers("partitions");
               partitionOpt <- partitions;
               partition <- partitionOpt;
               entries <- redis.zrangebyscore(s"m:${partition}", max = clock.currentTimeMillis, limit = None)
 
-            ) kinesis.remove(entries)
+            ) if (entries.nonEmpty) kinesis.remove(entries)
             redis.hset("lastSequence", kinesis.config.shard, s.seq)
-            logger.info("sync complete")
+
             syncUUID = UUID.randomUUID().toString
             kinesis.sync(syncUUID)
           }
