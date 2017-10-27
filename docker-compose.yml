@@ -1,0 +1,18 @@
+version: '2'
+
+services:
+  redis:
+    image: redis:3-32bit
+    networks:
+      - noworlater
+    ports:
+      - "6379:6379"
+  kinesis:
+    image: dlsniper/kinesalite:1.11.4
+    networks:
+      - noworlater
+    ports:
+      - "4567:4567"
+networks:
+  noworlater:
+    driver: bridge
