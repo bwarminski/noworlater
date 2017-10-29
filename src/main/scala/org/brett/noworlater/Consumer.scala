@@ -12,7 +12,7 @@ object Consumer extends App with StrictLogging {
   logger.info("Starting")
   val kinesisClient = AmazonKinesisClientBuilder.standard().withEndpointConfiguration(new EndpointConfiguration("http://localhost:4567", "us-east-1")).build()
   val shard = "shardId-000000000000"
-  val config = KinesisStreamConfig("test", shard, 16, 300, "1")
+  val config = KinesisStreamConfig("test", shard, 300, "1")
   val kinesis = new KinesisStream(config, kinesisClient)
 
   var iterator = Option(kinesis.getIterator(None))
@@ -22,7 +22,7 @@ object Consumer extends App with StrictLogging {
     for (event <- records.events) {
       event match {
         case r: Remove  => {
-          for (id <- r.ids) logger.info(s"${id}")
+          logger.info(r.message.payload)
         }
         case _ => ;
       }

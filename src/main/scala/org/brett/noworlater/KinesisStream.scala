@@ -26,7 +26,7 @@ object KinesisStream {
 }
 
 case class StreamRecords(behindLatest: Long, nextIterator: Option[String], events: Seq[Messages.Message])
-case class KinesisStreamConfig(stream: String, shard: String, maxBuckets: BigInt, batchSize: Int, syncHashKey: String)
+case class KinesisStreamConfig(stream: String, shard: String, batchSize: Int, syncHashKey: String)
 
 /**
   * Basic single shard Kinesis reader implementation that rate limits and uses additive-increase-multiplicative-decrease to
@@ -79,34 +79,19 @@ class KinesisStream(val config: KinesisStreamConfig, kinesis: AmazonKinesis) ext
     buffer
   }
 
-  def add(messages: Seq[DelayedMessage]) = {
-    val records = messages.groupBy((m) => {
-      BigInt(1, MessageDigest.getInstance("MD5").digest(m.id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
-    }).flatMap((t) => {
-      val (partitionKey, ids) = t
-      ids.grouped(config.batchSize).map((group) => {
-        new PutRecordsRequestEntry()
-          .withPartitionKey(partitionKey.toString())
-          .withExplicitHashKey(partitionKey.toString())
-          .withData(gzip((out) => Messages.add(group, out)))
-      })
-    }).asJavaCollection
-    kinesis.putRecords(new PutRecordsRequest().withStreamName(config.stream).withRecords(records)) // This is a little dirty, no retry or anything
+  def add(message: DelayedMessage) = {
+    kinesis.putRecord(new PutRecordRequest()
+      .withPartitionKey(message.id)
+      .withData(gzip((out) => Messages.add(message, out)))
+      .withStreamName(config.stream))
+    // This is a little dirty, no retry or anything
   }
 
-  def remove(ids: Seq[String]) = {
-    val records = ids.groupBy((id) => {
-      BigInt(1, MessageDigest.getInstance("MD5").digest(id.getBytes(StandardCharsets.UTF_8))) % config.maxBuckets
-    }).flatMap((t) => {
-      val (partitionKey, ids) = t
-      ids.grouped(config.batchSize).map((group) => {
-        new PutRecordsRequestEntry()
-          .withPartitionKey(partitionKey.toString())
-          .withExplicitHashKey(partitionKey.toString())
-          .withData(gzip((out) => Messages.remove(group, out)))
-      })
-    }).asJavaCollection
-    kinesis.putRecords(new PutRecordsRequest().withStreamName(config.stream).withRecords(records))
+  def remove(message: DelayedMessage) = {
+    kinesis.putRecord(new PutRecordRequest()
+      .withPartitionKey(message.id)
+      .withData(gzip((out) => Messages.remove(message, out)))
+      .withStreamName(config.stream))
   }
 
   def sync(id: String) = {
