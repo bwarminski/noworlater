@@ -1,6 +1,7 @@
 package org.brett.noworlater
 
 import java.io.File
+import java.lang.Double
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.UUID
@@ -9,9 +10,9 @@ import java.util.concurrent.TimeUnit
 import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration
 import com.amazonaws.services.kinesis.AmazonKinesisClientBuilder
 import com.codahale.metrics.{ConsoleReporter, CsvReporter}
-import com.redis.RedisClient
 import com.typesafe.scalalogging.StrictLogging
 import nl.grons.metrics.scala.DefaultInstrumented
+import redis.clients.jedis.{Jedis, PipelineBase}
 
 /**
   * Created by bwarminski on 10/25/17.
@@ -23,7 +24,7 @@ object Worker extends App with StrictLogging {
   val config = KinesisStreamConfig("test", shard, 300, "1")
   val kinesis = new KinesisStream(config, kinesisClient)
 
-  val redis = new RedisClient("localhost", 6379)
+  val redis = new Jedis("localhost", 6379)
   val worker = new Worker(kinesis, redis, SystemClock, 16)
   val reporter = CsvReporter.forRegistry(worker.metricRegistry)
     .convertRatesTo(TimeUnit.SECONDS)
@@ -41,7 +42,9 @@ object SystemClock extends Clock {
   override def currentTimeMillis: Long = System.currentTimeMillis()
 }
 
-class Worker(val kinesis: KinesisStream, val redis: RedisClient, val clock: Clock, val maxBuckets: BigInt) extends StrictLogging with DefaultInstrumented {
+class Worker(val kinesis: KinesisStream, val redis: Jedis, val clock: Clock, val maxBuckets: BigInt) extends StrictLogging with DefaultInstrumented {
+  import scala.collection.JavaConverters._
+
   val bucketStep = BigInt("340282366920938463463374607431768211455") / maxBuckets
 
   val kinesisGetTimer = metrics.timer("kinesis-get")
@@ -54,63 +57,88 @@ class Worker(val kinesis: KinesisStream, val redis: RedisClient, val clock: Cloc
   val rangeLookupTimer = metrics.timer("checkpoint-zrange")
   val dataGetTimer = metrics.timer("checkpoint-get")
   val kinesisWriteTimer = metrics.timer("kinesis-put")
+  val ingestTimer = metrics.timer("ingest")
+  val syncTimer = metrics.timer("sync")
 
   def run(): Unit = {
     import Messages._
     var syncUUID = UUID.randomUUID().toString
     kinesis.sync(syncUUID)
 
-    val startingSequence = redis.hget("lastSequence", kinesis.config.shard)
-    var iterator = Option(kinesis.getIterator(startingSequence))
+    val startingSequence = Option(redis.hget("lastSequence", kinesis.config.shard))
+    var kinesisIterator = Option(kinesis.getIterator(startingSequence))
 
-    while (iterator.isDefined) {
-      val records = kinesisGetTimer.time { kinesis.nextRecords(iterator.get) }
+    while (kinesisIterator.isDefined) {
+      val records = kinesisGetTimer.time { kinesis.nextRecords(kinesisIterator.get) }
       eventsIn.mark(records.events.size)
       millisBehind.+=(records.behindLatest)
-      iterator = records.nextIterator
-      for (event <- records.events) {
-        event match {
-          case a: Add  => {
-            val b = bucket(a.message.id)
-            addTimer.time { redis.pipeline((multi) => {
-              multi.sadd("partitions", b)
-              multi.zadd(s"m:${b}", a.message.deliverAt.toDouble, a.message.id)
-              multi.set(s"d:${a.message.id}", a.message.payload)
-              multi.hset("lastSequence", kinesis.config.shard, a.seq)
-            })}
-          }
-          case r: Remove => {
-            val b = bucket(r.message.id)
-            removeTimer.time { redis.pipeline((multi) => {
-              multi.sadd("partitions", b)
-              multi.zrem(s"m:${b}", r.message.id)
-              multi.del(s"d:${r.message.id}")
-              multi.hset("lastSequence", kinesis.config.shard, r.seq)
-            })}
-          }
-          case s: Sync if s.id == syncUUID => checkpointTimer.time{
-//            redis.evalMultiBulk()
-            for (
-              partitions <- redis.smembers("partitions");
-              partitionOpt <- partitions;
-              partition <- partitionOpt;
-              entries <- redis.zrangebyscoreWithScore(s"m:${partition}", max = clock.currentTimeMillis, limit = None);
-              entry <- entries
-            ) {
-              val (id, deliverAt) = entry
-              val payload = dataGetTimer.time { redis.get(s"d:$id").getOrElse("") }
-              val message = DelayedMessage(id, deliverAt.toLong, payload)
-              kinesisWriteTimer.time { kinesis.remove(message) }
-              eventsOut.mark()
-            }
-            redis.hset("lastSequence", kinesis.config.shard, s.seq)
+      kinesisIterator = records.nextIterator
 
-            syncUUID = UUID.randomUUID().toString
-            kinesis.sync(syncUUID)
+      val eventsIterator = records.events.iterator
+      def ingest: Option[Sync] = {
+        var checkpoint: Option[Sync] = None
+        var adds: Vector[Add] = Vector()
+        var removes: Vector[Remove] = Vector()
+        while (eventsIterator.hasNext && checkpoint.isEmpty) {
+          eventsIterator.next() match {
+            case a: Add => adds = adds :+ a
+            case r: Remove => removes = removes :+ r
+            case s: Sync if s.id == syncUUID => checkpoint = Some(s)
+            case c: Message => logger.warn(s"Skipping message ${c}")
           }
-          case c: Message => logger.warn(s"Skipping message ${c}")
+        }
+
+        if (adds.nonEmpty || removes.nonEmpty) ingestTimer.time {
+          val bucketedAdds = adds.groupBy((a) => bucket(a.message.id))
+          val bucketedRemoves = removes.groupBy((a) => bucket(a.message.id))
+          val multi = redis.pipelined()
+          multi.multi()
+          JedisHelper.saddStringPipeline(multi, "partitions", (bucketedAdds.keySet ++ bucketedRemoves.keySet).toSeq: _*)
+          if (bucketedAdds.nonEmpty) {
+            for ((b, a) <- bucketedAdds) {
+              val scores = a.foldLeft(Map[String, Double]())((map, add) => map + (add.message.id -> add.message.deliverAt.toDouble)).asJava
+              val data = a.foldLeft(Map[String, String]())((map, add) => map + (add.message.id -> add.message.payload)).asJava
+              multi.zadd(s"m:${b}", scores)
+              multi.hmset(s"d:${b}", data)
+            }
+          }
+          if (bucketedRemoves.nonEmpty) {
+            for ((b, r) <- bucketedRemoves) {
+              val ids = r.map(_.message.id)
+              multi.zrem(s"m:${b}", ids: _*)
+              multi.hdel(s"d:${b}", ids: _*)
+            }
+          }
+          multi.exec()
+          multi.sync()
+        }
+        checkpoint
+      }
+      var checkpoint: Option[Sync] = ingest
+
+      syncTimer.time {
+        for (
+          s <- checkpoint;
+          partition <- redis.smembers("partitions").asScala
+        ) {
+          val tuples = redis.zrangeByScoreWithScores(s"m:${partition}", Double.NEGATIVE_INFINITY, clock.currentTimeMillis).asScala.toSeq
+          if (tuples.nonEmpty) {
+            val data = redis.hmget(s"d:${partition}", tuples.map(_.getElement).toSeq: _*).asScala
+            kinesis.removeAll(tuples.zip(data).map((z) => {
+              val (tuple, data) = z
+              DelayedMessage(tuple.getElement, tuple.getScore.toLong, data)
+            }))
+          }
         }
       }
+      if (checkpoint.isDefined) {
+        syncUUID = UUID.randomUUID().toString
+        kinesis.sync(syncUUID)
+      }
+
+      ingest
+
+      for (last <- records.events.lastOption) redis.hset("lastSequence", kinesis.config.shard, last.seq)
 
     }
   }

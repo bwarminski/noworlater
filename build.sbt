@@ -10,7 +10,7 @@ libraryDependencies ++= Seq(
   "ch.qos.logback" % "logback-classic" % "1.0.13",
 
   "com.amazonaws" % "aws-java-sdk-kinesis" % "1.11.218",
-  "net.debasishg" %% "redisclient" % "3.4",
+  "redis.clients" % "jedis" % "2.9.0",
   "com.fasterxml.jackson.core" % "jackson-core" % "2.6.6",
   "com.fasterxml.jackson.core" % "jackson-databind" % "2.6.6",
   "com.google.guava" % "guava" % "21.0",

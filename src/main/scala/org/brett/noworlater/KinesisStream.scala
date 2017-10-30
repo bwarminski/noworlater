@@ -94,6 +94,15 @@ class KinesisStream(val config: KinesisStreamConfig, kinesis: AmazonKinesis) ext
       .withStreamName(config.stream))
   }
 
+  def removeAll(messages: Seq[DelayedMessage]) = {
+    for ( batch <- messages.grouped(config.batchSize)) {
+      val records = batch.map((m) => new PutRecordsRequestEntry()
+        .withPartitionKey(m.id)
+        .withData(gzip((out) => Messages.remove(m, out)))).asJava
+      kinesis.putRecords(new PutRecordsRequest().withStreamName(config.stream).withRecords(records))
+    }
+  }
+
   def sync(id: String) = {
     kinesis.putRecord(new PutRecordRequest()
       .withStreamName(config.stream)
